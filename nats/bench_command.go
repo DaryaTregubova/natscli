@@ -29,15 +29,28 @@ import (
 )
 
 type benchCmd struct {
-	subject  string
-	numPubs  int
-	numSubs  int
-	numMsg   int
-	msgSize  int
-	csvFile  string
-	progress bool
-	ack      bool
+	subject        string
+	numPubs        int
+	numSubs        int
+	numMsg         int
+	msgSize        int
+	csvFile        string
+	progress       bool
+	request        bool
+	js             bool
+	jsFile         bool
+	pull           bool
+	ack            bool
+	replicas       int
+	noPurge        bool
+	noDeleteStream bool
 }
+
+const (
+	JS_STREAM_NAME       string = "benchstream"
+	JS_PUSHCONSUMER_NAME string = "pushconsumer"
+	JS_PULLCONSUMER_NAME string = "pullconsumer"
+)
 
 func configureBenchCommand(app *kingpin.Application) {
 	c := &benchCmd{}
@@ -49,10 +62,17 @@ func configureBenchCommand(app *kingpin.Application) {
 	bench.Flag("size", "Size of the test messages").Default("128").IntVar(&c.msgSize)
 	bench.Flag("csv", "Save benchmark data to CSV file").StringVar(&c.csvFile)
 	bench.Flag("progress", "Enable progress bar while publishing").Default("true").BoolVar(&c.progress)
-	bench.Flag("ack", "Waits for acknowledgement on messages using Requests rather than Publish").Default("false").BoolVar(&c.ack)
+	bench.Flag("request", "Waits for acknowledgement on messages using Requests rather than Publish").Default("false").BoolVar(&c.request)
+	bench.Flag("streaming", "Use JetStream streaming").Default("false").BoolVar(&c.js)
+	bench.Flag("jsfile", "Persist the stream to file").Default("false").BoolVar(&c.jsFile)
+	bench.Flag("pull", "Uses JS pull consumers").Default("false").BoolVar(&c.pull)
+	bench.Flag("ack", "Acks consumption of messages").Default("false").BoolVar(&c.ack)
+	bench.Flag("replicas", "Number of stream replicas").Default("1").IntVar(&c.replicas)
+	bench.Flag("nopurge", "Do not purge the stream before running").Default("false").BoolVar(&c.noPurge)
+	bench.Flag("nodelete", "Do not delete the stream at the end of the run").Default("false").BoolVar(&c.noDeleteStream)
 
 	cheats["bench"] = `# benchmark JetStream acknowledged publishes
-nats bench --ack --msgs 10000 ORDERS.bench
+nats bench --request --msgs 10000 ORDERS.bench
 
 # benchmark core nats publish and subscribe with 10 publishers and subscribers
 nats bench --pub 10 --sub 10 --msgs 10000 --size 512
@@ -64,9 +84,9 @@ func (c *benchCmd) bench(_ *kingpin.ParseContext) error {
 		return fmt.Errorf("number of messages should be greater than 0")
 	}
 
-	log.Printf("Starting benchmark [msgs=%s, msgsize=%s, pubs=%d, subs=%d]", humanize.Comma(int64(c.numMsg)), humanize.IBytes(uint64(c.msgSize)), c.numPubs, c.numSubs)
+	log.Printf("Starting benchmark [msgs=%s, msgsize=%s, pubs=%d, subs=%d, js=%v, jsfile=%v, request=%v, pull=%v, ack=%v, replicas=%d, nopurge=%v, nodelete=%d]", humanize.Comma(int64(c.numMsg)), humanize.IBytes(uint64(c.msgSize)), c.numPubs, c.numSubs, c.js, c.jsFile, c.request, c.pull, c.ack, c.replicas, c.noPurge, c.noDeleteStream)
 
-	if c.ack && c.progress {
+	if c.request && c.progress {
 		log.Printf("Disabling progress bars in request mode")
 		c.progress = false
 	}
@@ -75,6 +95,54 @@ func (c *benchCmd) bench(_ *kingpin.ParseContext) error {
 
 	startwg := &sync.WaitGroup{}
 	donewg := &sync.WaitGroup{}
+
+	var js nats.JetStreamContext
+
+	if c.js {
+		// create the stream for the benchmark (and purge it)
+		nc, err := nats.Connect(config.ServerURL(), natsOpts()...)
+		if err != nil {
+			log.Fatal("nats connection %d failed: %s")
+			return err
+		}
+
+		js, err = nc.JetStream()
+		if err != nil {
+			log.Fatalf("couldn't create jetstream context: %v", err)
+		}
+
+		storageType := func() nats.StorageType {
+			if c.jsFile {
+				return nats.FileStorage
+			} else {
+				return nats.MemoryStorage
+			}
+		}()
+
+		js.AddStream(&nats.StreamConfig{Name: JS_STREAM_NAME, Subjects: []string{c.subject}, Retention: nats.LimitsPolicy, MaxConsumers: -1, MaxMsgs: -1, MaxBytes: -1, Discard: nats.DiscardOld, MaxAge: 9223372036854775807, MaxMsgsPerSubject: -1, MaxMsgSize: -1, Storage: storageType, Replicas: c.replicas, Duplicates: time.Second * 2})
+		if !c.noPurge {
+			log.Printf("Purging the stream")
+			js.PurgeStream(JS_STREAM_NAME)
+		}
+
+		if !c.noDeleteStream {
+			log.Printf("Will delete the stream at the end of the run")
+			defer js.DeleteStream(JS_STREAM_NAME)
+		}
+
+		// create the pull consumer
+		if c.pull && c.numSubs > 0 {
+			js.AddConsumer(JS_STREAM_NAME, &nats.ConsumerConfig{
+				Durable:       JS_PULLCONSUMER_NAME,
+				DeliverPolicy: nats.DeliverAllPolicy,
+				AckPolicy:     nats.AckExplicitPolicy,
+				ReplayPolicy:  nats.ReplayInstantPolicy,
+			})
+			defer js.DeleteConsumer(JS_STREAM_NAME, JS_PULLCONSUMER_NAME)
+		}
+	}
+
+	subCounts := bench.MsgsPerClient(c.numMsg, c.numSubs)
 
 	for i := 0; i < c.numSubs; i++ {
 		nc, err := nats.Connect(config.ServerURL(), natsOpts()...)
@@ -86,11 +154,32 @@ func (c *benchCmd) bench(_ *kingpin.ParseContext) error {
 		startwg.Add(1)
 		donewg.Add(1)
 
-		go c.runSubscriber(bm, nc, startwg, donewg)
+		numMsg := func() int {
+			if c.pull {
+				return subCounts[i]
+			} else {
+				return c.numMsg
+			}
+		}()
+
+		go c.runSubscriber(bm, nc, startwg, donewg, numMsg)
 	}
 	startwg.Wait()
 
+	// create push consumer if needed
+	if js != nil && c.numSubs > 0 && !c.pull {
+		js.AddConsumer(JS_STREAM_NAME, &nats.ConsumerConfig{
+			Durable:        JS_PUSHCONSUMER_NAME,
+			DeliverSubject: c.subject + ".pushconsumer",
+			DeliverPolicy:  nats.DeliverAllPolicy,
+			AckPolicy:      nats.AckAllPolicy,
+			ReplayPolicy:   nats.ReplayInstantPolicy,
+		})
+		defer js.DeleteConsumer(JS_STREAM_NAME, JS_PUSHCONSUMER_NAME)
+	}
+
 	pubCounts := bench.MsgsPerClient(c.numMsg, c.numPubs)
+
 	for i := 0; i < c.numPubs; i++ {
 		nc, err := nats.Connect(config.ServerURL(), natsOpts()...)
 		if err != nil {
@@ -158,7 +247,7 @@ func (c *benchCmd) runPublisher(bm *bench.Benchmark, nc *nats.Conn, startwg *syn
 			progress.Incr()
 		}
 
-		if !c.ack {
+		if !c.request {
 			nc.Publish(c.subject, msg)
 			continue
 		}
@@ -181,28 +270,68 @@ func (c *benchCmd) runPublisher(bm *bench.Benchmark, nc *nats.Conn, startwg *syn
 	donewg.Done()
 }
 
-func (c *benchCmd) runSubscriber(bm *bench.Benchmark, nc *nats.Conn, startwg *sync.WaitGroup, donewg *sync.WaitGroup) {
+func (c *benchCmd) runSubscriber(bm *bench.Benchmark, nc *nats.Conn, startwg *sync.WaitGroup, donewg *sync.WaitGroup, numMsg int) {
 	received := 0
 	ch := make(chan time.Time, 2)
 
-	sub, _ := nc.Subscribe(c.subject, func(msg *nats.Msg) {
+	mh := func(msg *nats.Msg) {
 		received++
+		if c.js && c.ack {
+			msg.Ack()
+		}
 		if received == 1 {
 			ch <- time.Now()
 		}
-		if received >= c.numMsg {
+		if received >= numMsg {
 			ch <- time.Now()
 		}
-	})
+	}
+	var sub *nats.Subscription
+
+	log.Printf("Starting subscriber, expecting %s messages", humanize.Comma(int64(numMsg)))
+
+	if c.js {
+		js, err := nc.JetStream()
+		if err != nil {
+			log.Fatalf("couldn't create jetstream context: %v", err)
+		}
+
+		if c.pull {
+			//sub, _ = js.SubscribeSync(c.subject)
+			sub, err = js.PullSubscribe(c.subject, JS_PULLCONSUMER_NAME)
+			if err != nil {
+				println("error pullsubscribe=" + err.Error())
+			}
+		} else {
+			sub, _ = nc.Subscribe(c.subject+".pushconsumer", mh)
+		}
+	} else {
+		sub, _ = nc.Subscribe(c.subject, mh)
+	}
 
 	sub.SetPendingLimits(-1, -1)
 	nc.Flush()
 	startwg.Done()
 
+	if c.js && c.pull {
+		for i := 0; i < numMsg; i++ {
+			msg, err := sub.NextMsg(time.Second * 3)
+			if err == nil {
+				mh(msg)
+			} else {
+				log.Fatalf("pull consumer timed out")
+			}
+		}
+	}
+
 	start := <-ch
 	end := <-ch
 
 	bm.AddSubSample(bench.NewSample(c.numMsg, c.msgSize, start, end, nc))
+
+	if sub != nil {
+		sub.Unsubscribe()
+	}
 
 	nc.Close()
 	donewg.Done()
