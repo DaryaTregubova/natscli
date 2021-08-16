@@ -40,6 +40,7 @@ type benchCmd struct {
 	js             bool
 	jsFile         bool
 	pull           bool
+	pullBatch      int
 	ack            bool
 	replicas       int
 	noPurge        bool
@@ -65,7 +66,8 @@ func configureBenchCommand(app *kingpin.Application) {
 	bench.Flag("request", "Waits for acknowledgement on messages using Requests rather than Publish").Default("false").BoolVar(&c.request)
 	bench.Flag("streaming", "Use JetStream streaming").Default("false").BoolVar(&c.js)
 	bench.Flag("jsfile", "Persist the stream to file").Default("false").BoolVar(&c.jsFile)
-	bench.Flag("pull", "Uses JS pull consumers").Default("false").BoolVar(&c.pull)
+	bench.Flag("pull", "Uses a JS pull consumer").Default("false").BoolVar(&c.pull)
+	bench.Flag("pullbatch", "Sets the batch size for the JS pull consumer").Default("1").IntVar(&c.pullBatch)
 	bench.Flag("ack", "Acks consumption of messages").Default("false").BoolVar(&c.ack)
 	bench.Flag("replicas", "Number of stream replicas").Default("1").IntVar(&c.replicas)
 	bench.Flag("nopurge", "Do not purge the stream before running").Default("false").BoolVar(&c.noPurge)
@@ -84,7 +86,7 @@ func (c *benchCmd) bench(_ *kingpin.ParseContext) error {
 		return fmt.Errorf("number of messages should be greater than 0")
 	}
 
-	log.Printf("Starting benchmark [msgs=%s, msgsize=%s, pubs=%d, subs=%d, js=%v, jsfile=%v, request=%v, pull=%v, ack=%v, replicas=%d, nopurge=%v, nodelete=%v]", humanize.Comma(int64(c.numMsg)), humanize.IBytes(uint64(c.msgSize)), c.numPubs, c.numSubs, c.js, c.jsFile, c.request, c.pull, c.ack, c.replicas, c.noPurge, c.noDeleteStream)
+	log.Printf("Starting benchmark [msgs=%s, msgsize=%s, pubs=%d, subs=%d, js=%v, jsfile=%v, request=%v, pull=%v, pullbatch=%d, ack=%v, replicas=%d, nopurge=%v, nodelete=%v]", humanize.Comma(int64(c.numMsg)), humanize.IBytes(uint64(c.msgSize)), c.numPubs, c.numSubs, c.js, c.jsFile, c.request, c.pull, c.pullBatch, c.ack, c.replicas, c.noPurge, c.noDeleteStream)
 
 	if c.request && c.progress {
 		log.Printf("Disabling progress bars in request mode")
@@ -313,12 +315,20 @@ func (c *benchCmd) runSubscriber(bm *bench.Benchmark, nc *nats.Conn, startwg *sy
 	startwg.Done()
 
 	if c.js && c.pull {
-		for i := 0; i < numMsg; i++ {
-			msgs, err := sub.Fetch(1)
+		for i := 0; i < numMsg; {
+			batchSize := func() int {
+				if c.pullBatch <= (numMsg - i) {
+					return c.pullBatch
+				} else {
+					return numMsg - i
+				}
+			}()
+			msgs, err := sub.Fetch(batchSize)
 			if err == nil {
 				for _, msg := range msgs {
 					mh(msg)
 				}
+				i += len(msgs)
 			} else {
 				log.Fatalf("pull consumer timed out")
 			}
