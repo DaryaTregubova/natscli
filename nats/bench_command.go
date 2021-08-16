@@ -297,7 +297,6 @@ func (c *benchCmd) runSubscriber(bm *bench.Benchmark, nc *nats.Conn, startwg *sy
 		}
 
 		if c.pull {
-			//sub, _ = js.SubscribeSync(c.subject)
 			sub, err = js.PullSubscribe(c.subject, JS_PULLCONSUMER_NAME)
 			if err != nil {
 				println("error pullsubscribe=" + err.Error())
@@ -315,9 +314,11 @@ func (c *benchCmd) runSubscriber(bm *bench.Benchmark, nc *nats.Conn, startwg *sy
 
 	if c.js && c.pull {
 		for i := 0; i < numMsg; i++ {
-			msg, err := sub.NextMsg(time.Second * 3)
+			msgs, err := sub.Fetch(1)
 			if err == nil {
-				mh(msg)
+				for _, msg := range msgs {
+					mh(msg)
+				}
 			} else {
 				log.Fatalf("pull consumer timed out")
 			}
