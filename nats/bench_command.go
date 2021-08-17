@@ -64,7 +64,7 @@ func configureBenchCommand(app *kingpin.Application) {
 	bench.Flag("csv", "Save benchmark data to CSV file").StringVar(&c.csvFile)
 	bench.Flag("progress", "Enable progress bar while publishing").Default("true").BoolVar(&c.progress)
 	bench.Flag("request", "Waits for acknowledgement on messages using Requests rather than Publish").Default("false").BoolVar(&c.request)
-	bench.Flag("streaming", "Use JetStream streaming").Default("false").BoolVar(&c.js)
+	bench.Flag("js", "Use JetStream streaming").Default("false").BoolVar(&c.js)
 	bench.Flag("jsfile", "Persist the stream to file").Default("false").BoolVar(&c.jsFile)
 	bench.Flag("pull", "Uses a JS pull consumer").Default("false").BoolVar(&c.pull)
 	bench.Flag("pullbatch", "Sets the batch size for the JS pull consumer").Default("1").IntVar(&c.pullBatch)
@@ -143,7 +143,6 @@ func (c *benchCmd) bench(_ *kingpin.ParseContext) error {
 			defer js.DeleteConsumer(JS_STREAM_NAME, JS_PULLCONSUMER_NAME)
 		}
 	}
-
 	subCounts := bench.MsgsPerClient(c.numMsg, c.numSubs)
 
 	for i := 0; i < c.numSubs; i++ {
@@ -301,10 +300,13 @@ func (c *benchCmd) runSubscriber(bm *bench.Benchmark, nc *nats.Conn, startwg *sy
 		if c.pull {
 			sub, err = js.PullSubscribe(c.subject, JS_PULLCONSUMER_NAME)
 			if err != nil {
-				println("error pullsubscribe=" + err.Error())
+				println("error PullSubscribe=" + err.Error())
 			}
 		} else {
 			sub, _ = nc.Subscribe(c.subject+".pushconsumer", mh)
+			if err != nil {
+				log.Fatalf("Push consumer subscription error: %v", err)
+			}
 		}
 	} else {
 		sub, _ = nc.Subscribe(c.subject, mh)
@@ -341,7 +343,10 @@ func (c *benchCmd) runSubscriber(bm *bench.Benchmark, nc *nats.Conn, startwg *sy
 	bm.AddSubSample(bench.NewSample(c.numMsg, c.msgSize, start, end, nc))
 
 	if sub != nil {
-		sub.Unsubscribe()
+		err := sub.Unsubscribe()
+		if err != nil {
+			log.Printf("error unsubscribing: %v", err)
+		}
 	}
 
 	nc.Close()
