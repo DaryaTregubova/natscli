@@ -45,6 +45,7 @@ type benchCmd struct {
 	replicas       int
 	noPurge        bool
 	noDeleteStream bool
+	maxAckPending  int
 }
 
 const (
@@ -72,6 +73,7 @@ func configureBenchCommand(app *kingpin.Application) {
 	bench.Flag("replicas", "Number of stream replicas").Default("1").IntVar(&c.replicas)
 	bench.Flag("nopurge", "Do not purge the stream before running").Default("false").BoolVar(&c.noPurge)
 	bench.Flag("nodelete", "Do not delete the stream at the end of the run").Default("false").BoolVar(&c.noDeleteStream)
+	bench.Flag("maxackpending", "Max acks pending for JS consumer").Default("-1").IntVar(&c.maxAckPending)
 
 	cheats["bench"] = `# benchmark JetStream acknowledged publishes
 nats bench --request --msgs 10000 ORDERS.bench
@@ -86,11 +88,15 @@ func (c *benchCmd) bench(_ *kingpin.ParseContext) error {
 		return fmt.Errorf("number of messages should be greater than 0")
 	}
 
-	log.Printf("Starting benchmark [msgs=%s, msgsize=%s, pubs=%d, subs=%d, js=%v, jsfile=%v, request=%v, pull=%v, pullbatch=%d, ack=%v, replicas=%d, nopurge=%v, nodelete=%v]", humanize.Comma(int64(c.numMsg)), humanize.IBytes(uint64(c.msgSize)), c.numPubs, c.numSubs, c.js, c.jsFile, c.request, c.pull, c.pullBatch, c.ack, c.replicas, c.noPurge, c.noDeleteStream)
+	log.Printf("Starting benchmark [msgs=%s, msgsize=%s, pubs=%d, subs=%d, js=%v, jsfile=%v, request=%v, pull=%v, pullbatch=%d, ack=%v, maxackpending=%d, replicas=%d, nopurge=%v, nodelete=%v]", humanize.Comma(int64(c.numMsg)), humanize.IBytes(uint64(c.msgSize)), c.numPubs, c.numSubs, c.js, c.jsFile, c.request, c.pull, humanize.Comma(int64(c.pullBatch)), c.ack, humanize.Comma(int64(c.maxAckPending)), c.replicas, c.noPurge, c.noDeleteStream)
 
 	if c.request && c.progress {
 		log.Printf("Disabling progress bars in request mode")
 		c.progress = false
+	}
+
+	if c.js && c.maxAckPending != -1 && c.maxAckPending < c.numMsg && !c.ack && c.numSubs > 0 {
+		log.Printf("WARNING: max acks pending is smaller than the mumber of messages and the subscribers are not set to ack, use --ack or you run the risk of the consumers not receiving all the messages!")
 	}
 
 	bm := bench.NewBenchmark("NATS", c.numSubs, c.numPubs)
@@ -139,6 +145,7 @@ func (c *benchCmd) bench(_ *kingpin.ParseContext) error {
 				DeliverPolicy: nats.DeliverAllPolicy,
 				AckPolicy:     nats.AckExplicitPolicy,
 				ReplayPolicy:  nats.ReplayInstantPolicy,
+				MaxAckPending: c.maxAckPending,
 			})
 			defer js.DeleteConsumer(JS_STREAM_NAME, JS_PULLCONSUMER_NAME)
 		}
@@ -175,6 +182,7 @@ func (c *benchCmd) bench(_ *kingpin.ParseContext) error {
 			DeliverPolicy:  nats.DeliverAllPolicy,
 			AckPolicy:      nats.AckAllPolicy,
 			ReplayPolicy:   nats.ReplayInstantPolicy,
+			MaxAckPending:  c.maxAckPending,
 		})
 		defer js.DeleteConsumer(JS_STREAM_NAME, JS_PUSHCONSUMER_NAME)
 	}
@@ -332,7 +340,7 @@ func (c *benchCmd) runSubscriber(bm *bench.Benchmark, nc *nats.Conn, startwg *sy
 				}
 				i += len(msgs)
 			} else {
-				log.Fatalf("pull consumer timed out")
+				log.Fatalf("pull consumer error: %v", err)
 			}
 		}
 	}
