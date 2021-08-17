@@ -68,7 +68,7 @@ func configureBenchCommand(app *kingpin.Application) {
 	bench.Flag("js", "Use JetStream streaming").Default("false").BoolVar(&c.js)
 	bench.Flag("jsfile", "Persist the stream to file").Default("false").BoolVar(&c.jsFile)
 	bench.Flag("pull", "Uses a JS pull consumer").Default("false").BoolVar(&c.pull)
-	bench.Flag("pullbatch", "Sets the batch size for the JS pull consumer").Default("1").IntVar(&c.pullBatch)
+	bench.Flag("pullbatch", "Sets the batch size for the JS pull consumer").Default("100").IntVar(&c.pullBatch)
 	bench.Flag("ack", "Acks consumption of messages").Default("false").BoolVar(&c.ack)
 	bench.Flag("replicas", "Number of stream replicas").Default("1").IntVar(&c.replicas)
 	bench.Flag("nopurge", "Do not purge the stream before running").Default("false").BoolVar(&c.noPurge)
