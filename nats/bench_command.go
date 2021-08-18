@@ -36,8 +36,9 @@ type benchCmd struct {
 	msgSize        int
 	csvFile        string
 	progress       bool
-	request        bool
+	syncPub        bool
 	js             bool
+	pubBatch       int
 	jsFile         bool
 	pull           bool
 	pullBatch      int
@@ -64,8 +65,9 @@ func configureBenchCommand(app *kingpin.Application) {
 	bench.Flag("size", "Size of the test messages").Default("128").IntVar(&c.msgSize)
 	bench.Flag("csv", "Save benchmark data to CSV file").StringVar(&c.csvFile)
 	bench.Flag("progress", "Enable progress bar while publishing").Default("true").BoolVar(&c.progress)
-	bench.Flag("request", "Waits for acknowledgement on messages using Requests rather than Publish").Default("false").BoolVar(&c.request)
+	bench.Flag("syncpub", "Synchronously waits for acknowledgement on published messages (using Request in NATS or synchronous Publish in JS)").Default("false").BoolVar(&c.syncPub)
 	bench.Flag("js", "Use JetStream streaming").Default("false").BoolVar(&c.js)
+	bench.Flag("pubbatch", "Sets the batch size for JS asynchronous publishing").Default("100").IntVar(&c.pubBatch)
 	bench.Flag("jsfile", "Persist the stream to file").Default("false").BoolVar(&c.jsFile)
 	bench.Flag("pull", "Uses a JS pull consumer").Default("false").BoolVar(&c.pull)
 	bench.Flag("pullbatch", "Sets the batch size for the JS pull consumer").Default("100").IntVar(&c.pullBatch)
@@ -76,10 +78,22 @@ func configureBenchCommand(app *kingpin.Application) {
 	bench.Flag("maxackpending", "Max acks pending for JS consumer").Default("-1").IntVar(&c.maxAckPending)
 
 	cheats["bench"] = `# benchmark JetStream acknowledged publishes
-nats bench --request --msgs 10000 ORDERS.bench
+nats bench testsubject --syncpub --msgs=10000 ORDERS.bench
 
 # benchmark core nats publish and subscribe with 10 publishers and subscribers
-nats bench --pub 10 --sub 10 --msgs 10000 --size 512
+nats bench testsubject --pub=10 --sub=10 --msgs=10000 --size=512
+
+# benchmark JS publish and push consumers at the same time
+nats bench testsubject --pub=4 --sub=4 --js
+
+# benchmark JS stream purge and async batched publish into the stream
+nats bench testsubject --pub=4 --sub=0 --js --nodelete 
+
+# benchmark JS stream do not purge and get replay from the stream using a push consumer
+nats bench testsubject --pub=0 --sub=4 --js --nodelete --nopurge
+
+# benchmark JS stream do not purge and get replay from the stream using a pull consumer
+nats bench testsubject --pub=0 --sub=4 --js --nodelete --nopurge --pull
 `
 }
 
@@ -88,10 +102,10 @@ func (c *benchCmd) bench(_ *kingpin.ParseContext) error {
 		return fmt.Errorf("number of messages should be greater than 0")
 	}
 
-	log.Printf("Starting benchmark [msgs=%s, msgsize=%s, pubs=%d, subs=%d, js=%v, jsfile=%v, request=%v, pull=%v, pullbatch=%s, ack=%v, maxackpending=%s, replicas=%d, nopurge=%v, nodelete=%v]", humanize.Comma(int64(c.numMsg)), humanize.IBytes(uint64(c.msgSize)), c.numPubs, c.numSubs, c.js, c.jsFile, c.request, c.pull, humanize.Comma(int64(c.pullBatch)), c.ack, humanize.Comma(int64(c.maxAckPending)), c.replicas, c.noPurge, c.noDeleteStream)
+	log.Printf("Starting benchmark [msgs=%s, msgsize=%s, pubs=%d, subs=%d, js=%v, jsfile=%v, syncpub=%v, pubbatch=%s, pull=%v, pullbatch=%s, ack=%v, maxackpending=%s, replicas=%d, nopurge=%v, nodelete=%v]", humanize.Comma(int64(c.numMsg)), humanize.IBytes(uint64(c.msgSize)), c.numPubs, c.numSubs, c.js, c.jsFile, c.syncPub, humanize.Comma(int64(c.pubBatch)), c.pull, humanize.Comma(int64(c.pullBatch)), c.ack, humanize.Comma(int64(c.maxAckPending)), c.replicas, c.noPurge, c.noDeleteStream)
 
-	if c.request && c.progress {
-		log.Printf("Disabling progress bars in request mode")
+	if c.syncPub && c.progress {
+		log.Printf("Disabling progress bars in syncpub mode")
 		c.progress = false
 	}
 
@@ -245,30 +259,72 @@ func (c *benchCmd) runPublisher(bm *bench.Benchmark, nc *nats.Conn, startwg *syn
 
 	start := time.Now()
 
-	var m *nats.Msg
-	var err error
+	if !c.js {
+		if !c.syncPub {
+			for i := 0; i < numMsg; i++ {
+				if progress != nil {
+					progress.Incr()
+				}
+				nc.Publish(c.subject, msg)
+				continue
+			}
+		} else {
+			var m *nats.Msg
+			var err error
 
-	errBytes := []byte("error")
-	minusByte := byte('-')
+			errBytes := []byte("error")
+			minusByte := byte('-')
 
-	for i := 0; i < numMsg; i++ {
-		if progress != nil {
-			progress.Incr()
+			for i := 0; i < numMsg; i++ {
+				if progress != nil {
+					progress.Incr()
+				}
+
+				if !c.syncPub {
+					nc.Publish(c.subject, msg)
+				}
+
+				m, err = nc.Request(c.subject, msg, time.Second)
+				if err != nil {
+					log.Println(err)
+				}
+
+				if len(m.Data) == 0 || m.Data[0] == minusByte || bytes.Contains(m.Data, errBytes) {
+					log.Printf("Did not receive a positive ACK: %q", m.Data)
+				}
+			}
 		}
-
-		if !c.request {
-			nc.Publish(c.subject, msg)
-			continue
-		}
-
-		m, err = nc.Request(c.subject, msg, time.Second)
+	} else {
+		js, err := nc.JetStream()
 		if err != nil {
-			log.Println(err)
-			continue
+			log.Fatalf("couldn't create jetstream context: %v", err)
 		}
 
-		if len(m.Data) == 0 || m.Data[0] == minusByte || bytes.Contains(m.Data, errBytes) {
-			log.Printf("Did not receive a positive ACK: %q", m.Data)
+		if !c.syncPub {
+			for i := 0; i < numMsg; i += c.pubBatch {
+				for j := 0; j < c.pubBatch && i+j < c.numMsg; j++ {
+					if progress != nil {
+						progress.Incr()
+					}
+					js.PublishAsync(c.subject, msg)
+					if err != nil {
+						log.Fatalf("PubAsync error: %v", err)
+					}
+				}
+
+				select {
+				case <-js.PublishAsyncComplete():
+				case <-time.After(time.Second):
+					log.Fatalf("JS PubAsync did not receive a positive ack")
+				}
+			}
+		} else {
+			for i := 0; i < numMsg; i++ {
+				if progress != nil {
+					progress.Incr()
+				}
+				js.Publish(c.subject, msg)
+			}
 		}
 	}
 
@@ -348,7 +404,7 @@ func (c *benchCmd) runSubscriber(bm *bench.Benchmark, nc *nats.Conn, startwg *sy
 	start := <-ch
 	end := <-ch
 
-	bm.AddSubSample(bench.NewSample(c.numMsg, c.msgSize, start, end, nc))
+	bm.AddSubSample(bench.NewSample(numMsg, c.msgSize, start, end, nc))
 
 	if sub != nil {
 		err := sub.Unsubscribe()
