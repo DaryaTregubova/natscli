@@ -188,19 +188,6 @@ func (c *benchCmd) bench(_ *kingpin.ParseContext) error {
 	}
 	startwg.Wait()
 
-	// create push consumer if needed
-	if js != nil && c.numSubs > 0 && !c.pull {
-		js.AddConsumer(JS_STREAM_NAME, &nats.ConsumerConfig{
-			Durable:        JS_PUSHCONSUMER_NAME,
-			DeliverSubject: c.subject + ".pushconsumer",
-			DeliverPolicy:  nats.DeliverAllPolicy,
-			AckPolicy:      nats.AckAllPolicy,
-			ReplayPolicy:   nats.ReplayInstantPolicy,
-			MaxAckPending:  c.maxAckPending,
-		})
-		defer js.DeleteConsumer(JS_STREAM_NAME, JS_PUSHCONSUMER_NAME)
-	}
-
 	pubCounts := bench.MsgsPerClient(c.numMsg, c.numPubs)
 
 	for i := 0; i < c.numPubs; i++ {
@@ -375,9 +362,9 @@ func (c *benchCmd) runSubscriber(bm *bench.Benchmark, nc *nats.Conn, startwg *sy
 				println("error PullSubscribe=" + err.Error())
 			}
 		} else {
-			sub, _ = nc.Subscribe(c.subject+".pushconsumer", mh)
+			sub, _ = js.Subscribe(c.subject, mh, nats.OrderedConsumer())
 			if err != nil {
-				log.Fatalf("Push consumer subscription error: %v", err)
+				log.Fatalf("Push consumer Subscribe error: %v", err)
 			}
 		}
 	} else {
