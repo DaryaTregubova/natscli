@@ -265,8 +265,10 @@ func (c *benchCmd) runPublisher(bm *bench.Benchmark, nc *nats.Conn, startwg *syn
 				if progress != nil {
 					progress.Incr()
 				}
-				nc.Publish(c.subject, msg)
-				continue
+				err := nc.Publish(c.subject, msg)
+				if err != nil {
+					log.Fatalf("Publish error: %s", err)
+				}
 			}
 		} else {
 			var m *nats.Msg
@@ -281,16 +283,19 @@ func (c *benchCmd) runPublisher(bm *bench.Benchmark, nc *nats.Conn, startwg *syn
 				}
 
 				if !c.syncPub {
-					nc.Publish(c.subject, msg)
+					err = nc.Publish(c.subject, msg)
+					if err != nil {
+						log.Fatalf("Publish error: %s", err)
+					}
 				}
 
 				m, err = nc.Request(c.subject, msg, time.Second)
 				if err != nil {
-					log.Println(err)
+					log.Fatalf("Request error: %s", err)
 				}
 
 				if len(m.Data) == 0 || m.Data[0] == minusByte || bytes.Contains(m.Data, errBytes) {
-					log.Printf("Did not receive a positive ACK: %q", m.Data)
+					log.Fatalf("Publish Request did not receive a positive ACK: %q", m.Data)
 				}
 			}
 		}
@@ -323,7 +328,10 @@ func (c *benchCmd) runPublisher(bm *bench.Benchmark, nc *nats.Conn, startwg *syn
 				if progress != nil {
 					progress.Incr()
 				}
-				js.Publish(c.subject, msg)
+				_, err = js.Publish(c.subject, msg)
+				if err != nil {
+					log.Fatalf("Publish error: %s", err)
+				}
 			}
 		}
 	}
