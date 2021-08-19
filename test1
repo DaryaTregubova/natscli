@@ -1,0 +1,1 @@
+nats pub beacons.po.test.node2 --server=web-db-1.staging.vc.restr.im:4222 'service-status/service_status:{"channel":"7e099bfe-fa27-4d86-a784-6377432ae372","status":"disconnect","moment":1}'
